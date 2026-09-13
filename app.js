@@ -305,6 +305,7 @@ els.detailView.addEventListener("submit", (event) => {
   if (!text) return;
   game[key].push(text);
   renderAll();
+  renderParty(); // 规则条目数会影响讲解/准备/计分时长，时间线立即重排
 });
 
 els.detailView.addEventListener("click", (event) => {
@@ -319,6 +320,7 @@ els.detailView.addEventListener("click", (event) => {
     const index = Number(ruleButton.dataset.ruleIndex);
     game[key].splice(index, 1);
     renderAll();
+    renderParty(); // 规则条目数会影响讲解/准备/计分时长，时间线立即重排
   }
 
   if (playedButton) {
@@ -379,6 +381,7 @@ const partyEls = {
 };
 
 const partyHistory = { past: [], future: [] };
+let bootNotice = "";
 
 function defaultParty() {
   return {
@@ -401,7 +404,12 @@ function ensurePartyState() {
   if (!/^\d{2}:\d{2}$/.test(state.party.startTime || "")) state.party.startTime = "19:00";
   // 刷新恢复时清掉指向已删桌游的失效引用
   state.party.sessions = state.party.sessions.filter((s) => gameById(s.gameId));
-  normalizeSlots(state.party.sessions);
+  // 历史数据若存在相邻重复，加载时先修复（能换则换，否则移除未锁定的一局）
+  const beforeCleanup = JSON.stringify(state.party.sessions);
+  state.party.sessions = enforceNoAdjacent(state.party.sessions);
+  if (JSON.stringify(state.party.sessions) !== beforeCleanup) {
+    bootNotice = "已自动修复历史方案中的相邻重复场次。";
+  }
 }
 
 function clampInt(value, min, max, fallback) {
@@ -460,7 +468,7 @@ function pickFittingGame(ranked, { used, prevId, remaining, tableHistory }) {
     ranked.find((game) => !used.has(game.id) && game.id !== prevId && fits(game)) ||
     ranked.find((game) => tableHistory.has(game.id) && game.id !== prevId && fits(game)) ||
     ranked.find((game) => game.id !== prevId && fits(game)) ||
-    (ranked[0] && fits(ranked[0]) ? ranked[0] : null)
+    null
   );
 }
 
@@ -468,8 +476,6 @@ function pickAnyGame(ranked, { used, prevId, tableHistory }) {
   return (
     ranked.find((game) => !used.has(game.id) && game.id !== prevId) ||
     ranked.find((game) => tableHistory.has(game.id) && game.id !== prevId) ||
-    ranked.find((game) => game.id !== prevId) ||
-    ranked[0] ||
     null
   );
 }
@@ -523,7 +529,62 @@ function buildPlan(players, totalMinutes, focus, keepSessions = []) {
       slot += 1;
     }
   }
-  return sessions;
+  return enforceNoAdjacent(sessions);
+}
+
+/* ---------- 相邻重复守卫：任何路径产生的方案都必须满足“连续开桌不重复” ---------- */
+
+function findAdjacentPairs(tableSessions) {
+  const sorted = tableSessions.slice().sort((a, b) => a.slot - b.slot);
+  const pairs = [];
+  for (let i = 1; i < sorted.length; i += 1) {
+    if (sorted[i].gameId === sorted[i - 1].gameId) pairs.push([sorted[i - 1], sorted[i]]);
+  }
+  return pairs;
+}
+
+// 某一场次在当前阵容下可以换成哪些游戏（不等于左右邻居，且适配每桌人数）
+function replacementOptions(sessions, session) {
+  const { perTable } = tableSplit(state.party.players);
+  const laid = layoutSessions(sessions).filter((item) => item.table === session.table);
+  const index = laid.findIndex((item) => item.id === session.id);
+  const prevId = laid[index - 1]?.gameId;
+  const nextId = laid[index + 1]?.gameId;
+  return rankGames(perTable, state.party.focus).filter((game) => game.id !== prevId && game.id !== nextId);
+}
+
+// 尝试修复一对相邻重复：优先替换未锁定的那一局；无法修复返回 null
+function repairPair(sessions, pair) {
+  const targets = [pair[1], pair[0]].filter((session) => !session.locked);
+  for (const target of targets) {
+    const options = replacementOptions(sessions, target);
+    if (options.length) return { sessionId: target.id, game: options[0] };
+  }
+  return null;
+}
+
+// 生成/加载后的兜底清理：能换就换，换不了就移除未锁定的一局，绝不留下相邻重复
+function enforceNoAdjacent(sessions) {
+  normalizeSlots(sessions);
+  const tables = [...new Set(sessions.map((session) => session.table))];
+  for (const table of tables) {
+    let guard = 0;
+    while (guard < 25) {
+      guard += 1;
+      const pairs = findAdjacentPairs(sessions.filter((session) => session.table === table));
+      if (!pairs.length) break;
+      const repair = repairPair(sessions, pairs[0]);
+      if (repair) {
+        sessions.find((session) => session.id === repair.sessionId).gameId = repair.game.id;
+        continue;
+      }
+      const droppable = [pairs[0][1], pairs[0][0]].find((session) => !session.locked);
+      if (!droppable) break; // 两局都被锁定，只能保留并在界面上警示
+      sessions = sessions.filter((session) => session.id !== droppable.id);
+      normalizeSlots(sessions);
+    }
+  }
+  return normalizeSlots(sessions);
 }
 
 function normalizeSlots(sessions) {
@@ -664,10 +725,8 @@ function replanParty(reason) {
   );
 }
 
-// 中途插队：找到不违反“连续不重复”的最早空位插入
-function insertSession(gameId) {
-  const game = gameById(gameId);
-  if (!game) return null;
+// 中途插队：只接受不违反“连续不重复”的位置；没有空位就返回 null 让调用方拒绝
+function findInsertPosition(gameId) {
   const { tables } = tableSplit(state.party.players);
   const laid = layoutSessions(state.party.sessions);
   let best = null;
@@ -683,47 +742,77 @@ function insertSession(gameId) {
       }
     }
   }
-  if (!best) {
-    const totals = Array.from({ length: tables }, (_, i) => {
-      const tableSessions = laid.filter((session) => session.table === i + 1);
-      return { table: i + 1, end: tableSessions.length ? Math.max(...tableSessions.map((s) => s.end)) : 0, count: tableSessions.length };
-    }).sort((a, b) => a.end - b.end);
-    const target = totals[0];
-    best = { table: target.table, index: target.count, start: target.end };
-  }
-  state.party.sessions.forEach((session) => {
-    if (session.table === best.table && session.slot >= best.index) session.slot += 1;
-  });
-  state.party.sessions.push({ id: crypto.randomUUID(), gameId, table: best.table, slot: best.index, locked: false });
   return best;
+}
+
+// 移除一局：预演结果，若源桌出现相邻重复则先尝试换一款修复，修不了就整单取消
+function guardRemoval(sessionId) {
+  const session = state.party.sessions.find((item) => item.id === sessionId);
+  if (!session) return null;
+  const working = state.party.sessions.filter((item) => item.id !== sessionId).map((item) => ({ ...item }));
+  normalizeSlots(working);
+  let note = "";
+  let guard = 0;
+  while (guard < 10) {
+    guard += 1;
+    const pairs = findAdjacentPairs(working.filter((item) => item.table === session.table));
+    if (!pairs.length) return { sessions: working, note };
+    const repair = repairPair(working, pairs[0]);
+    if (!repair) return null;
+    const target = working.find((item) => item.id === repair.sessionId);
+    target.gameId = repair.game.id;
+    note += `；为避免相邻重复，${session.table} 号桌第 ${target.slot + 1} 局已替换为《${repair.game.name}》`;
+  }
+  return null;
 }
 
 function moveSession(sessionId, targetTable, targetIndex) {
   const session = state.party.sessions.find((item) => item.id === sessionId);
-  if (!session) return false;
+  if (!session) return;
   const { tables } = tableSplit(state.party.players);
   const table = Math.min(Math.max(1, targetTable), tables);
-  const siblings = state.party.sessions
+  // 先在副本上预演，确认不破坏规则再提交
+  const working = state.party.sessions.map((item) => ({ ...item }));
+  const moved = working.find((item) => item.id === sessionId);
+  const siblings = working
     .filter((item) => item.table === table && item.id !== sessionId)
     .sort((a, b) => a.slot - b.slot);
   const index = Math.min(Math.max(0, targetIndex), siblings.length);
-  const prev = siblings[index - 1];
-  const next = siblings[index];
-  if (prev?.gameId === session.gameId || next?.gameId === session.gameId) {
+  siblings.forEach((item, i) => {
+    item.slot = i >= index ? i + 1 : i;
+  });
+  moved.table = table;
+  moved.slot = index;
+  normalizeSlots(working);
+
+  if (findAdjacentPairs(working.filter((item) => item.table === table)).length) {
     showPartyMessage("不能把同一款桌游排到连续两局，已取消这次拖动。", "error");
-    return false;
+    return;
+  }
+  let note = "";
+  if (session.table !== table) {
+    let guard = 0;
+    while (guard < 10) {
+      guard += 1;
+      const pairs = findAdjacentPairs(working.filter((item) => item.table === session.table));
+      if (!pairs.length) break;
+      const repair = repairPair(working, pairs[0]);
+      if (!repair) {
+        showPartyMessage("拖走后源桌会留下相邻重复，且没有可替换的桌游，已取消这次拖动。", "error");
+        return;
+      }
+      const target = working.find((item) => item.id === repair.sessionId);
+      target.gameId = repair.game.id;
+      note += `；为避免源桌相邻重复，${session.table} 号桌第 ${target.slot + 1} 局已替换为《${repair.game.name}》`;
+    }
   }
   commitParty(() => {
-    state.party.sessions = state.party.sessions.filter((item) => item.id !== sessionId);
-    siblings.forEach((item, i) => {
-      item.slot = i >= index ? i + 1 : i;
-    });
-    session.table = table;
-    session.slot = index;
-    state.party.sessions.push(session, ...siblings.filter((s) => !state.party.sessions.includes(s)));
+    state.party.sessions = working;
   });
-  showPartyMessage(`已把《${gameById(session.gameId)?.name || "该局"}》移到 ${table} 号桌第 ${index + 1} 局，时间已重排。`, "ok");
-  return true;
+  showPartyMessage(
+    `已把《${gameById(session.gameId)?.name || "该局"}》移到 ${table} 号桌第 ${index + 1} 局，时间已重排${note}。`,
+    "ok"
+  );
 }
 
 function replaceCandidates(session) {
@@ -743,6 +832,11 @@ function sessionWarnings(laid, session) {
   }
   if (session.end > state.party.totalMinutes) {
     warnings.push(`超出总时长 ${session.end - state.party.totalMinutes} 分钟`);
+  }
+  const ordered = laid.filter((item) => item.table === session.table);
+  const index = ordered.findIndex((item) => item.id === session.id);
+  if (ordered[index - 1]?.gameId === session.gameId || ordered[index + 1]?.gameId === session.gameId) {
+    warnings.push("与相邻局重复同一款");
   }
   return warnings;
 }
@@ -918,6 +1012,7 @@ function validatePartyImport(payload) {
     const seenIds = new Set();
     const seenSlots = new Set();
     const perTable = errors.length ? 0 : tableSplit(players).perTable;
+    const maxTables = errors.length ? 0 : tableSplit(players).tables;
     rawSessions.forEach((raw, index) => {
       const label = `第 ${index + 1} 场`;
       if (!raw || typeof raw !== "object") {
@@ -934,6 +1029,10 @@ function validatePartyImport(payload) {
       const slot = Number(raw.slot);
       if (!Number.isInteger(table) || table < 1 || !Number.isInteger(slot) || slot < 0) {
         errors.push(`${label}：桌号或局序无效。`);
+        return;
+      }
+      if (maxTables && table > maxTables) {
+        errors.push(`桌号超出范围：${label} 在 ${table} 号桌，但 ${players} 人最多排 ${maxTables} 桌。`);
         return;
       }
       const slotKey = `${table}:${slot}`;
@@ -1057,14 +1156,28 @@ partyEls.insertBtn.addEventListener("click", () => {
     );
     return;
   }
+  const position = findInsertPosition(gameId);
+  if (!position) {
+    showPartyMessage(`插队失败：现在插入《${game.name}》都会与相邻局重复，已取消。`, "error");
+    return;
+  }
   commitParty(() => {
     pushDraft("插队前方案");
-    const position = insertSession(gameId);
-    showPartyMessage(
-      `已把《${game.name}》插到 ${position.table} 号桌第 ${position.index + 1} 局，时间已重排，插队前方案已存入草稿箱。`,
-      "ok"
-    );
+    state.party.sessions.forEach((session) => {
+      if (session.table === position.table && session.slot >= position.index) session.slot += 1;
+    });
+    state.party.sessions.push({
+      id: crypto.randomUUID(),
+      gameId,
+      table: position.table,
+      slot: position.index,
+      locked: false
+    });
   });
+  showPartyMessage(
+    `已把《${game.name}》插到 ${position.table} 号桌第 ${position.index + 1} 局，时间已重排，插队前方案已存入草稿箱。`,
+    "ok"
+  );
 });
 
 partyEls.saveDraftBtn.addEventListener("click", () => {
@@ -1101,10 +1214,16 @@ partyEls.timeline.addEventListener("click", (event) => {
     const id = removeBtn.dataset.sessionId;
     const session = state.party.sessions.find((item) => item.id === id);
     if (!session) return;
+    const result = guardRemoval(id);
+    if (!result) {
+      showPartyMessage("移除后会造成相邻重复，且没有可替换的桌游，已取消移除。", "error");
+      return;
+    }
+    const name = gameById(session.gameId)?.name || "该局";
     commitParty(() => {
-      state.party.sessions = state.party.sessions.filter((item) => item.id !== id);
+      state.party.sessions = result.sessions;
     });
-    showPartyMessage(`已移除《${gameById(session.gameId)?.name || "该局"}》，后续局时间已重排。`, "ok");
+    showPartyMessage(`已移除《${name}》，后续局时间已重排${result.note}。`, "ok");
   }
 });
 
@@ -1205,3 +1324,4 @@ if (!state.party.sessions.length && state.games.length) {
 setDefaultDate();
 renderAll();
 renderParty();
+if (bootNotice) showPartyMessage(bootNotice, "ok");
