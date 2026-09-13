@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>桌游规则遗忘点卡片库</title>
+    <title>桌游规则遗忘点卡片库 · 聚会主持台</title>
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
@@ -118,6 +118,68 @@
         <aside class="panel detail-panel">
           <div id="detailView"></div>
         </aside>
+      </section>
+
+      <section class="panel party-panel" id="partyPanel">
+        <div class="panel-head">
+          <div>
+            <h2>聚会主持台</h2>
+            <span>按人数与总时长自动编排多桌多局流程，可锁定、替换、拖拽微调，改动立即重排。</span>
+          </div>
+          <div class="party-actions">
+            <button id="undoPartyBtn" type="button" disabled>撤销</button>
+            <button id="redoPartyBtn" type="button" disabled>恢复</button>
+            <button id="exportPartyBtn" type="button">导出方案</button>
+            <button id="importPartyBtn" type="button">导入方案</button>
+            <input id="importPartyInput" type="file" accept="application/json,.json" hidden />
+          </div>
+        </div>
+
+        <form id="partyForm" class="party-form">
+          <label>
+            到场人数
+            <input id="partyPlayersInput" type="number" min="1" max="99" required />
+          </label>
+          <label>
+            总时长（分钟）
+            <input id="partyMinutesInput" type="number" min="30" max="1440" step="15" required />
+          </label>
+          <label>
+            开始时间
+            <input id="partyStartInput" type="time" />
+          </label>
+          <label>
+            复习重点
+            <select id="partyFocusInput">
+              <option value="forgets">容易忘的规则</option>
+              <option value="disputes">常见争议</option>
+              <option value="setup">开局准备</option>
+              <option value="scoring">计分提醒</option>
+            </select>
+          </label>
+          <button class="primary" type="submit">编排 / 重新编排</button>
+        </form>
+
+        <div class="party-adjust">
+          <button id="lateAdjustBtn" type="button" title="以上面填写的新人数重排，保留当前方案为草稿">
+            迟到/缺席，按新人数重排
+          </button>
+          <div class="insert-box">
+            <select id="insertGameSelect"></select>
+            <button id="insertGameBtn" type="button">中途插队加一局</button>
+          </div>
+          <button id="saveDraftBtn" type="button">当前方案存为草稿</button>
+        </div>
+
+        <p id="partyMessage" class="party-message" role="status"></p>
+        <div id="partyOvertime" class="party-overtime" hidden></div>
+
+        <div id="partyTimeline" class="party-timeline"></div>
+
+        <section class="draft-box">
+          <h3>草稿箱（调整前的方案自动保留在这里）</h3>
+          <ul id="draftList" class="draft-list"></ul>
+        </section>
       </section>
     </main>
 
